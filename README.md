@@ -1,4 +1,4 @@
-# LPNU-BiometricID
+# LPNU-Metaverse-Project
 This repository is intended to publicly share the research results and outcomes of the Embedded AI Lab in Lviv Polytechnic National University.
 
 ## Biometric identity design
