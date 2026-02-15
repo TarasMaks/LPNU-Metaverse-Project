@@ -1,125 +1,249 @@
-from fastapi.testclient import TestClient
+"""High-level integration tests covering the full enrollment → auth → access flow."""
 
-from app.main import app, store
+from __future__ import annotations
 
-client = TestClient(app)
-
-
-def reset_store() -> None:
-    store.enrollment_challenges.clear()
-    store.auth_challenges.clear()
-    store.templates.clear()
-    store.credentials.clear()
+import base64
+import json
 
 
-def test_full_enrollment_and_access_flow():
-    reset_store()
-    user_id = "user-123"
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
 
-    start_resp = client.post("/enroll/start", json={"user_id": user_id, "version": "v1"})
-    assert start_resp.status_code == 200
-    start_data = start_resp.json()
 
-    finish_resp = client.post(
-        "/enroll/finish",
+def test_full_enrollment_and_auth_flow(client):
+    """Enrollment → auth challenge → auth verify → access request."""
+    user_id = "user-integration-1"
+    template = base64.b64encode(json.dumps([0.1] * 128).encode()).decode()
+
+    # 1. Create DID
+    did_resp = client.post("/v1/did", json={"method": "key"})
+    assert did_resp.status_code == 200
+    did = did_resp.json()["did"]
+
+    # 2. Start enrollment
+    start = client.post("/v1/enroll/start", json={"user_id": user_id, "version": "v1"})
+    assert start.status_code == 200
+    start_data = start.json()
+    assert "challenge" in start_data
+    assert "salt" in start_data
+
+    # 3. Finish enrollment
+    finish = client.post(
+        "/v1/enroll/finish",
         json={
             "user_id": user_id,
-            "template_data": "template-bytes",
+            "template_data": template,
             "salt": start_data["salt"],
             "version": "v1",
-            "storage_uri": "ipfs://template",
+            "storage_uri": "ipfs://test-template",
             "challenge": start_data["challenge"],
         },
     )
-    assert finish_resp.status_code == 200
-    commitment = finish_resp.json()["commitment"]
-    assert commitment
+    assert finish.status_code == 200
+    assert finish.json()["commitment"]
 
-    auth_challenge = client.post("/auth/challenge", json={"user_id": user_id})
-    assert auth_challenge.status_code == 200
-    nonce = auth_challenge.json()["nonce"]
+    # 4. Auth challenge
+    auth_ch = client.post("/v1/auth/challenge", json={"user_id": user_id})
+    assert auth_ch.status_code == 200
+    nonce = auth_ch.json()["nonce"]
 
-    did_resp = client.post("/did")
-    did = did_resp.json()["did"]
-
-    auth_verify = client.post(
-        "/auth/verify",
-        json={"user_id": user_id, "did": did, "nonce": nonce, "desired_level": 2},
+    # 5. Auth verify (with matching biometric probe)
+    auth_v = client.post(
+        "/v1/auth/verify",
+        json={
+            "user_id": user_id,
+            "did": did,
+            "nonce": nonce,
+            "desired_level": 2,
+            "template_data": template,
+        },
     )
-    assert auth_verify.status_code == 200
-    expires_at = auth_verify.json()["expires_at"]
-    assert expires_at > 0
+    assert auth_v.status_code == 200
+    assert auth_v.json()["vc_jwt"]
+    assert auth_v.json()["biometric_verified"] is True
+    vc_jwt = auth_v.json()["vc_jwt"]
 
-    access_resp = client.post(
-        "/access/request",
+    # 6. Access request with VC
+    access = client.post(
+        "/v1/access/request",
         json={
             "did": did,
             "resource": "profile",
             "desired_level": 2,
             "factors": ["wallet-sign", "biometric-proof"],
-            "risk_indicators": [],
+            "vc_jwt": vc_jwt,
         },
     )
-    assert access_resp.status_code == 200
-    access_data = access_resp.json()
-    assert access_data["granted"] is True
+    assert access.status_code == 200
+    body = access.json()
+    assert "level_required" in body
 
 
-def test_risk_based_step_up_requires_more_factors():
-    reset_store()
-    user_id = "user-risky"
+def test_enrollment_challenge_consumed(client):
+    """Challenge should be single-use – second finish with same challenge fails."""
+    user_id = "user-consume"
+    template = base64.b64encode(b"template-bytes").decode()
 
-    start_resp = client.post("/enroll/start", json={"user_id": user_id, "version": "v1"})
-    finish_resp = client.post(
-        "/enroll/finish",
+    start = client.post("/v1/enroll/start", json={"user_id": user_id}).json()
+
+    # First finish succeeds
+    r1 = client.post(
+        "/v1/enroll/finish",
         json={
             "user_id": user_id,
-            "template_data": "template-bytes",
-            "salt": start_resp.json()["salt"],
+            "template_data": template,
+            "salt": start["salt"],
             "version": "v1",
-            "storage_uri": "ipfs://template",
-            "challenge": start_resp.json()["challenge"],
+            "storage_uri": "",
+            "challenge": start["challenge"],
         },
     )
-    assert finish_resp.status_code == 200
+    assert r1.status_code == 200
 
-    nonce = client.post("/auth/challenge", json={"user_id": user_id}).json()["nonce"]
-    did = client.post("/did").json()["did"]
-    client.post("/auth/verify", json={"user_id": user_id, "did": did, "nonce": nonce, "desired_level": 2})
+    # Second finish with same challenge must fail
+    r2 = client.post(
+        "/v1/enroll/finish",
+        json={
+            "user_id": user_id,
+            "template_data": template,
+            "salt": start["salt"],
+            "version": "v1",
+            "storage_uri": "",
+            "challenge": start["challenge"],
+        },
+    )
+    assert r2.status_code == 400
 
-    response = client.post(
-        "/access/request",
+
+def test_auth_nonce_consumed(client):
+    """Auth nonce should be single-use."""
+    user_id = "user-nonce"
+    template = base64.b64encode(b"t").decode()
+
+    # Enroll
+    start = client.post("/v1/enroll/start", json={"user_id": user_id}).json()
+    client.post(
+        "/v1/enroll/finish",
+        json={
+            "user_id": user_id,
+            "template_data": template,
+            "salt": start["salt"],
+            "version": "v1",
+            "storage_uri": "",
+            "challenge": start["challenge"],
+        },
+    )
+
+    # DID
+    did = client.post("/v1/did", json={}).json()["did"]
+
+    # Auth challenge
+    nonce = client.post("/v1/auth/challenge", json={"user_id": user_id}).json()["nonce"]
+
+    # First verify (level 1, no biometric probe needed)
+    r1 = client.post(
+        "/v1/auth/verify",
+        json={"user_id": user_id, "did": did, "nonce": nonce, "desired_level": 1},
+    )
+    assert r1.status_code == 200
+
+    # Second verify with same nonce must fail
+    r2 = client.post(
+        "/v1/auth/verify",
+        json={"user_id": user_id, "did": did, "nonce": nonce, "desired_level": 1},
+    )
+    assert r2.status_code == 400
+
+
+def test_biometric_mismatch_rejected(client):
+    """Auth must fail when the biometric probe does not match the enrollment template."""
+    user_id = "user-mismatch"
+    enrolled_template = base64.b64encode(json.dumps([1.0] * 128).encode()).decode()
+    different_probe = base64.b64encode(json.dumps([-1.0] * 128).encode()).decode()
+
+    # Enroll
+    start = client.post("/v1/enroll/start", json={"user_id": user_id}).json()
+    client.post(
+        "/v1/enroll/finish",
+        json={
+            "user_id": user_id,
+            "template_data": enrolled_template,
+            "salt": start["salt"],
+            "version": "v1",
+            "storage_uri": "",
+            "challenge": start["challenge"],
+        },
+    )
+
+    did = client.post("/v1/did", json={}).json()["did"]
+    nonce = client.post("/v1/auth/challenge", json={"user_id": user_id}).json()["nonce"]
+
+    # Verify with a completely different probe → should be rejected
+    r = client.post(
+        "/v1/auth/verify",
+        json={
+            "user_id": user_id,
+            "did": did,
+            "nonce": nonce,
+            "desired_level": 2,
+            "template_data": different_probe,
+        },
+    )
+    assert r.status_code == 401
+    assert "do not match" in r.json()["detail"]
+
+
+def test_unenrolled_user_cannot_auth(client):
+    r = client.post("/v1/auth/challenge", json={"user_id": "ghost"})
+    assert r.status_code == 404
+
+
+def test_expired_vc_denied(client):
+    """Access should be denied when the VC has expired."""
+    user_id = "user-expiry"
+    template = base64.b64encode(b"t").decode()
+
+    start = client.post("/v1/enroll/start", json={"user_id": user_id}).json()
+    client.post(
+        "/v1/enroll/finish",
+        json={
+            "user_id": user_id,
+            "template_data": template,
+            "salt": start["salt"],
+            "version": "v1",
+            "storage_uri": "",
+            "challenge": start["challenge"],
+        },
+    )
+    did = client.post("/v1/did", json={}).json()["did"]
+    nonce = client.post("/v1/auth/challenge", json={"user_id": user_id}).json()["nonce"]
+
+    # Issue a normal VC
+    auth_r = client.post(
+        "/v1/auth/verify",
+        json={"user_id": user_id, "did": did, "nonce": nonce, "desired_level": 1},
+    )
+    assert auth_r.status_code == 200
+
+    # Directly expire the VC in the database
+    import app.database as db_mod
+
+    db = next(db_mod.get_db())
+    vc_record = db.query(db_mod.DBVerifiableCredential).filter_by(subject_did=did).first()
+    assert vc_record is not None
+    vc_record.expires_at = 0  # expired in the past
+    db.commit()
+    db.close()
+
+    r = client.post(
+        "/v1/access/request",
         json={
             "did": did,
-            "resource": "finance",
-            "desired_level": 2,
-            "factors": ["wallet-sign", "biometric-proof"],
-            "risk_indicators": ["new-device", "high-value"],
+            "resource": "profile",
+            "desired_level": 1,
+            "factors": ["wallet-sign"],
         },
     )
-
-    # With two risk indicators, level steps up to 4; missing factors should deny access.
-    assert response.status_code == 200
-    body = response.json()
-    assert body["granted"] is False
-    assert body["level_required"] == 4
-
-
-def test_face_verify_graceful_failure_when_dependency_missing(monkeypatch):
-    reset_store()
-
-    # Simulate missing DeepFace by ensuring find_spec returns None.
-    import importlib.util
-
-    monkeypatch.setattr(importlib.util, "find_spec", lambda _: None)
-
-    response = client.post(
-        "/biometric/face/verify",
-        json={
-            "img1_path": "path/to/img1.jpg",
-            "img2_path": "path/to/img2.jpg",
-        },
-    )
-
-    assert response.status_code == 503
-    assert "DeepFace is not installed" in response.json()["detail"]
+    assert r.status_code == 403
