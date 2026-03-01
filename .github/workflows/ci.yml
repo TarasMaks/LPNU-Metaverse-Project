@@ -63,5 +63,11 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run tests
+        env:
+          DATABASE_URL: "sqlite://"
+          ETH_PROVIDER_URL: ""
+          L2_PROVIDER_URL: ""
+          IPFS_API_URL: ""
+          ALCHEMY_NOTIFY_TOKEN: ""
         run: |
           pytest tests/ -v --tb=short

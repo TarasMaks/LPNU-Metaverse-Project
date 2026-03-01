@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    volumes:
+      - db-data:/app/data
+    restart: unless-stopped
+
+  # Optional: local Ethereum node for blockchain integration testing
+  ganache:
+    image: trufflesuite/ganache:latest
+    ports:
+      - "8545:8545"
+    command: >
+      --deterministic
+      --accounts 10
+      --host 0.0.0.0
+    profiles:
+      - blockchain
+
+  # Optional: local IPFS node for storage testing
+  ipfs:
+    image: ipfs/kubo:latest
+    ports:
+      - "5001:5001"
+      - "8080:8080"
+    volumes:
+      - ipfs-data:/data/ipfs
+    profiles:
+      - storage
+
+volumes:
+  db-data:
+  ipfs-data:
