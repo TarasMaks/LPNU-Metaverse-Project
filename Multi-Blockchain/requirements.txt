@@ -1,0 +1,12 @@
+# Core
+fastapi==0.115.0
+pydantic==2.8.2
+pydantic-settings==2.5.2
+uvicorn==0.30.1
+
+# Blockchain
+web3==7.2.0
+
+# Testing
+httpx==0.27.0
+pytest==8.2.2
